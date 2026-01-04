@@ -275,7 +275,7 @@ app.get("/api/data", async (_req, res) => {
 // ---- Auth: prüft Passwort und gibt Token
 app.post("/api/auth", async (req, res) => {
   try {
-    const { password } = req.body || {};
+    const password = (req.body?.password ?? "").trim();
     if (!password) return res.status(400).json({ ok: false });
 
     const ok = await bcrypt.compare(password, EDIT_PASSWORD_HASH || "");
