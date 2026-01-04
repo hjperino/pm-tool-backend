@@ -1,6 +1,7 @@
 import express from "express";
 import helmet from "helmet";
 import bcrypt from "bcryptjs";
+import nodemailer from "nodemailer";
 
 const app = express();
 app.use(helmet());
