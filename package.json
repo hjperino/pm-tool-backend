@@ -2,10 +2,10 @@
   "name": "pm-tool-backend",
   "version": "1.0.0",
   "type": "module",
+   "license": "MIT",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
-  "license": "MIT"  
+    "start": "node server.js"  
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
