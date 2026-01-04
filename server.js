@@ -11,21 +11,33 @@ app.use(express.json({ limit: "1mb" }));
 const JSONBIN_BIN_ID = process.env.JSONBIN_BIN_ID;
 const JSONBIN_API_KEY = process.env.JSONBIN_API_KEY;
 const EDIT_PASSWORD_HASH = process.env.EDIT_PASSWORD_HASH; // bcrypt-hash
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map(o => o.trim().replace(/\/$/, ""))
+  .filter(Boolean);
 
-// ---- sehr simples CORS (nur deine erlaubten Origins)
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && ALLOWED_ORIGINS.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type,X-Editor-Token,X-Editor-Name,X-Editor-Email");
+  const normalizedOrigin = origin ? origin.replace(/\/$/, "") : "";
+
+  if (normalizedOrigin && ALLOWED_ORIGINS.includes(normalizedOrigin)) {
+    res.setHeader("Access-Control-Allow-Origin", normalizedOrigin);
     res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Methods", "GET,PUT,POST,OPTIONS");
     res.setHeader(
       "Access-Control-Allow-Headers",
       "Content-Type,X-Editor-Token,X-Editor-Name,X-Editor-Email"
     );
+    res.setHeader(
+      "Access-Control-Allow-Methods",
+      "GET,POST,PUT,OPTIONS"
+    );
   }
-  if (req.method === "OPTIONS") return res.sendStatus(204);
+
+  // wichtig für Preflight
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+
   next();
 });
 
