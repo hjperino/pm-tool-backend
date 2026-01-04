@@ -137,7 +137,7 @@ app.get("/api/data", async (req, res) => {
 
 // -------------------- MAIL: Change detection + debounce --------------------
 
-const WATCH_FIELDS = ["status", "title", "description", "deadline", "links", "assignedTo"];
+const WATCH_FIELDS = ["status", "title", "description", "comment", "deadline", "links", "assignedTo"];
 
 function normalizeTask(t) {
   const o = {};
