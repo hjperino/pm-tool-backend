@@ -104,4 +104,189 @@ app.put("/api/data", requireEditor, async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
+// ---- Mail / Team mapping
+const TEAM_EMAILS = (() => {
+  try {
+    return JSON.parse(process.env.TEAM_EMAILS_JSON || "{}");
+  } catch {
+    return {};
+  }
+})();
+
+const MAIL_FROM = process.env.MAIL_FROM || "PM-Tool <no-reply@example.com>";
+const MAIL_SUBJECT_PREFIX = process.env.MAIL_SUBJECT_PREFIX || "[PM-Tool]";
+const MAIL_DEBOUNCE_MINUTES = Number(process.env.MAIL_DEBOUNCE_MINUTES || "5");
+
+// ---- SMTP (Brevo)
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT || "587"),
+  secure: process.env.SMTP_SECURE === "true", // 587 => false (STARTTLS)
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
+  }
+});
+
+// optional: verify once on start (logs help a lot)
+transporter.verify()
+  .then(() => console.log("SMTP ready"))
+  .catch(err => console.error("SMTP error:", err.message));
+
+// ---- Debounce queue: one digest per recipient
+// Map<email, { timer: Timeout|null, items: Array<ChangeEvent>, lastEditor: {name,email}? }>
+const mailQueue = new Map();
+
+function resolveRecipientEmails(assignedTo) {
+  const names = Array.isArray(assignedTo) ? assignedTo : [];
+  const emails = [];
+  for (const n of names) {
+    const e = TEAM_EMAILS[n];
+    if (e) emails.push(e);
+  }
+  // unique + stable
+  return [...new Set(emails)];
+}
+
+function safeStr(v) {
+  return (v === null || v === undefined) ? "" : String(v);
+}
+
+function normalizeLinks(task) {
+  // your tasks may store links differently; support common patterns
+  const links = task?.links ?? task?.link ?? task?.url ?? null;
+  if (!links) return [];
+  if (Array.isArray(links)) return links.map(safeStr).map(s => s.trim()).filter(Boolean);
+  return safeStr(links).split(/\s+/).map(s => s.trim()).filter(Boolean);
+}
+
+function pickComparable(t) {
+  return {
+    status: safeStr(t?.status).trim(),
+    title: safeStr(t?.title).trim(),
+    description: safeStr(t?.description ?? t?.comment).trim(),
+    deadline: safeStr(t?.deadline).trim(),
+    links: normalizeLinks(t).sort(),
+    assignedTo: Array.isArray(t?.assignedTo) ? [...t.assignedTo].sort() : []
+  };
+}
+
+function diffOne(oldT, newT) {
+  const a = pickComparable(oldT);
+  const b = pickComparable(newT);
+
+  const changes = [];
+  const fields = ["status","title","description","deadline"] as const;
+
+  for (const f of fields) {
+    if (a[f] !== b[f]) changes.push({ field: f, from: a[f], to: b[f] });
+  }
+
+  // links
+  if (JSON.stringify(a.links) !== JSON.stringify(b.links)) {
+    changes.push({ field: "links", from: a.links.join(" "), to: b.links.join(" ") });
+  }
+
+  // assignedTo
+  if (JSON.stringify(a.assignedTo) !== JSON.stringify(b.assignedTo)) {
+    changes.push({ field: "assignedTo", from: a.assignedTo.join(", "), to: b.assignedTo.join(", ") });
+  }
+
+  return changes;
+}
+
+function diffTasks(oldTasks, newTasks) {
+  const oldMap = new Map((oldTasks || []).map(t => [t.id, t]));
+  const newMap = new Map((newTasks || []).map(t => [t.id, t]));
+
+  const created = [];
+  const deleted = [];
+  const updated = [];
+
+  for (const [id, nt] of newMap.entries()) {
+    const ot = oldMap.get(id);
+    if (!ot) {
+      created.push(nt);
+    } else {
+      const changes = diffOne(ot, nt);
+      if (changes.length) updated.push({ oldTask: ot, newTask: nt, changes });
+    }
+  }
+
+  for (const [id, ot] of oldMap.entries()) {
+    if (!newMap.has(id)) deleted.push(ot);
+  }
+
+  return { created, deleted, updated };
+}
+
+function formatDigestText(changeEvents, editor) {
+  const who = editor?.name
+    ? `${editor.name}${editor.email ? ` <${editor.email}>` : ""}`
+    : (editor?.email || "unbekannt");
+
+  const lines = [];
+  lines.push(`${MAIL_SUBJECT_PREFIX} Task-Änderungen`);
+  lines.push(`Geändert von: ${who}`);
+  lines.push(`Zeit: ${new Date().toLocaleString("de-CH")}`);
+  lines.push("");
+  for (const ev of changeEvents) {
+    if (ev.type === "created") {
+      lines.push(`NEU: ${safeStr(ev.task?.title)} (ID ${ev.task?.id})`);
+      lines.push(`Status: ${safeStr(ev.task?.status)} | Deadline: ${safeStr(ev.task?.deadline)}`);
+      lines.push("");
+    } else if (ev.type === "deleted") {
+      lines.push(`GELÖSCHT: ${safeStr(ev.task?.title)} (ID ${ev.task?.id})`);
+      lines.push("");
+    } else if (ev.type === "updated") {
+      lines.push(`GEÄNDERT: ${safeStr(ev.task?.title)} (ID ${ev.task?.id})`);
+      for (const c of ev.changes) {
+        lines.push(`- ${c.field}: "${safeStr(c.from)}" → "${safeStr(c.to)}"`);
+      }
+      lines.push("");
+    }
+  }
+  return lines.join("\n");
+}
+
+async function sendDigestEmail(toEmail, changeEvents, editor) {
+  const subject = `${MAIL_SUBJECT_PREFIX} Änderungen an deinen Tasks (${changeEvents.length})`;
+  const text = formatDigestText(changeEvents, editor);
+
+  await transporter.sendMail({
+    from: MAIL_FROM,
+    to: toEmail,
+    subject,
+    text
+  });
+}
+
+function enqueueChanges(recipientEmail, changeEvents, editor) {
+  const existing = mailQueue.get(recipientEmail) || { timer: null, items: [], lastEditor: null };
+  existing.items.push(...changeEvents);
+  existing.lastEditor = editor || existing.lastEditor;
+
+  if (!existing.timer) {
+    existing.timer = setTimeout(async () => {
+      const data = mailQueue.get(recipientEmail);
+      if (!data) return;
+
+      // Snapshot then clear before sending (avoid duplicates on error loops)
+      const items = data.items.slice();
+      const ed = data.lastEditor;
+      mailQueue.delete(recipientEmail);
+
+      try {
+        await sendDigestEmail(recipientEmail, items, ed);
+        console.log("Digest sent to", recipientEmail, "items:", items.length);
+      } catch (err) {
+        console.error("Digest send failed to", recipientEmail, err?.message || err);
+        // If you want retry, re-enqueue once:
+        // enqueueChanges(recipientEmail, items, ed);
+      }
+    }, MAIL_DEBOUNCE_MINUTES * 60 * 1000);
+  }
+
+  mailQueue.set(recipientEmail, existing);
+}
 app.listen(port, () => console.log("Listening on", port));
