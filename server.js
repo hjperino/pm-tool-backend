@@ -11,11 +11,46 @@ app.use(express.json({ limit: "1mb" }));
 const JSONBIN_BIN_ID = process.env.JSONBIN_BIN_ID;
 const JSONBIN_API_KEY = process.env.JSONBIN_API_KEY;
 const EDIT_PASSWORD_HASH = process.env.EDIT_PASSWORD_HASH; // bcrypt-hash
+
+// CORS
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
-  .map(o => o.trim().replace(/\/$/, ""))
+  .map((s) => s.trim().replace(/\/$/, ""))
   .filter(Boolean);
 
+// Mail
+const MAIL_DEBOUNCE_MINUTES = Number(process.env.MAIL_DEBOUNCE_MINUTES || "5");
+const MAIL_FROM = process.env.MAIL_FROM || "PM Tool <teamki4@dlh.zh.ch>";
+const MAIL_SUBJECT_PREFIX = process.env.MAIL_SUBJECT_PREFIX || "[PM-Tool]";
+
+// TEAM_EMAILS_JSON: {"Hansjuerg Perino":"hansjuerg.perino@dlh.zh.ch","Name2":"name2@..."}
+let TEAM_EMAILS = {};
+try {
+  TEAM_EMAILS = JSON.parse(process.env.TEAM_EMAILS_JSON || "{}");
+} catch {
+  TEAM_EMAILS = {};
+}
+
+// ---- SMTP Transport (only if configured)
+const smtpConfigured =
+  !!process.env.SMTP_HOST &&
+  !!process.env.SMTP_PORT &&
+  !!process.env.SMTP_USER &&
+  !!process.env.SMTP_PASS;
+
+const transporter = smtpConfigured
+  ? nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT),
+      secure: process.env.SMTP_SECURE === "true",
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS,
+      },
+    })
+  : null;
+
+// ---- sehr simples CORS (nur erlaubte Origins)
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   const normalizedOrigin = origin ? origin.replace(/\/$/, "") : "";
@@ -23,21 +58,14 @@ app.use((req, res, next) => {
   if (normalizedOrigin && ALLOWED_ORIGINS.includes(normalizedOrigin)) {
     res.setHeader("Access-Control-Allow-Origin", normalizedOrigin);
     res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET,PUT,POST,OPTIONS");
     res.setHeader(
       "Access-Control-Allow-Headers",
       "Content-Type,X-Editor-Token,X-Editor-Name,X-Editor-Email"
     );
-    res.setHeader(
-      "Access-Control-Allow-Methods",
-      "GET,POST,PUT,OPTIONS"
-    );
   }
 
-  // wichtig für Preflight
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
-
+  if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
@@ -46,236 +74,38 @@ function jsonbinUrl() {
   return `https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`;
 }
 
-// ---- Token-Mechanik (minimalistisch, aber besser als Passwort im Frontend)
-// Wir geben bei erfolgreicher Passwortprüfung ein kurzlebiges Token zurück.
+// ---- Token-Mechanik (minimalistisch)
 function makeToken() {
-  // simpel: random string; in produktiv evtl. JWT. Für deinen Zweck reicht das oft.
-  return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  return (
+    Math.random().toString(36).slice(2) +
+    Math.random().toString(36).slice(2) +
+    Date.now().toString(36)
+  );
 }
-const tokenStore = new Map(); // token -> expiresAt (ms)
+
+const tokenStore = new Map(); // token -> expiresAt
 
 function requireEditor(req, res, next) {
   const token = req.headers["x-editor-token"];
-  if (!token || !tokenStore.has(token)) return res.status(401).json({ error: "Not authorized" });
-  const expiresAt = tokenStore.get(token);
-  if (Date.now() > expiresAt) {
-    tokenStore.delete(token);
-    return res.status(401).json({ error: "Token expired" });
-  }
+  if (!token || typeof token !== "string") return res.status(401).json({ ok: false });
+
+  const exp = tokenStore.get(token);
+  if (!exp || exp < Date.now()) return res.status(401).json({ ok: false });
+
+  // optional identity
+  req.editorName = (req.headers["x-editor-name"] || "").toString();
+  req.editorEmail = (req.headers["x-editor-email"] || "").toString();
+
   next();
 }
 
-// ------------------------------
-// Mail / Team mapping + Debounce
-// ------------------------------
-const TEAM_EMAILS = (() => {
-  try {
-    return JSON.parse(process.env.TEAM_EMAILS_JSON || "{}");
-  } catch {
-    return {};
-  }
-})();
-
-const MAIL_FROM = process.env.MAIL_FROM || "PM-Tool <no-reply@example.com>";
-const MAIL_SUBJECT_PREFIX = process.env.MAIL_SUBJECT_PREFIX || "[PM-Tool]";
-const MAIL_DEBOUNCE_MINUTES = Number(process.env.MAIL_DEBOUNCE_MINUTES || "5");
-
-// ---- SMTP (Brevo)
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT || "587"),
-  secure: process.env.SMTP_SECURE === "true", // 587 => false (STARTTLS)
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
-  }
-});
-
-// optional: verify once on start (logs help a lot)
-transporter
-  .verify()
-  .then(() => console.log("SMTP ready"))
-  .catch(err => console.error("SMTP error:", err.message));
-
-// ---- Debounce queue: one digest per recipient
-// Map<email, { timer: Timeout|null, items: Array<ChangeEvent>, lastEditor: {name,email}? }>
-const mailQueue = new Map();
-
-function resolveRecipientEmails(assignedTo) {
-  const names = Array.isArray(assignedTo) ? assignedTo : [];
-  const emails = [];
-  for (const n of names) {
-    const e = TEAM_EMAILS[n];
-    if (e) emails.push(e);
-  }
-  // unique + stable
-  return [...new Set(emails)];
-}
-
-function safeStr(v) {
-  return v === null || v === undefined ? "" : String(v);
-}
-
-function normalizeLinks(task) {
-  // your tasks may store links differently; support common patterns
-  const links = task?.links ?? task?.link ?? task?.url ?? null;
-  if (!links) return [];
-  if (Array.isArray(links)) return links.map(safeStr).map(s => s.trim()).filter(Boolean);
-  return safeStr(links).split(/\s+/).map(s => s.trim()).filter(Boolean);
-}
-
-function pickComparable(t) {
-  return {
-    status: safeStr(t?.status).trim(),
-    title: safeStr(t?.title).trim(),
-    description: safeStr(t?.description ?? t?.comment).trim(),
-    deadline: safeStr(t?.deadline).trim(),
-    links: normalizeLinks(t).sort(),
-    assignedTo: Array.isArray(t?.assignedTo) ? [...t.assignedTo].sort() : []
-  };
-}
-
-function diffOne(oldT, newT) {
-  const a = pickComparable(oldT);
-  const b = pickComparable(newT);
-
-  const changes = [];
-  const fields = ["status", "title", "description", "deadline"];
-
-  for (const f of fields) {
-    if (a[f] !== b[f]) changes.push({ field: f, from: a[f], to: b[f] });
-  }
-
-  // links
-  if (JSON.stringify(a.links) !== JSON.stringify(b.links)) {
-    changes.push({ field: "links", from: a.links.join(" "), to: b.links.join(" ") });
-  }
-
-  // assignedTo
-  if (JSON.stringify(a.assignedTo) !== JSON.stringify(b.assignedTo)) {
-    changes.push({ field: "assignedTo", from: a.assignedTo.join(", "), to: b.assignedTo.join(", ") });
-  }
-
-  return changes;
-}
-
-function diffTasks(oldTasks, newTasks) {
-  const oldMap = new Map((oldTasks || []).map(t => [t.id, t]));
-  const newMap = new Map((newTasks || []).map(t => [t.id, t]));
-
-  const created = [];
-  const deleted = [];
-  const updated = [];
-
-  for (const [id, nt] of newMap.entries()) {
-    const ot = oldMap.get(id);
-    if (!ot) {
-      created.push(nt);
-    } else {
-      const changes = diffOne(ot, nt);
-      if (changes.length) updated.push({ oldTask: ot, newTask: nt, changes });
-    }
-  }
-
-  for (const [id, ot] of oldMap.entries()) {
-    if (!newMap.has(id)) deleted.push(ot);
-  }
-
-  return { created, deleted, updated };
-}
-
-function formatDigestText(changeEvents, editor) {
-  const who = editor?.name
-    ? `${editor.name}${editor.email ? ` <${editor.email}>` : ""}`
-    : editor?.email || "unbekannt";
-
-  const lines = [];
-  lines.push(`${MAIL_SUBJECT_PREFIX} Task-Änderungen`);
-  lines.push(`Geändert von: ${who}`);
-  lines.push(`Zeit: ${new Date().toLocaleString("de-CH")}`);
-  lines.push("");
-
-  for (const ev of changeEvents) {
-    if (ev.type === "created") {
-      lines.push(`NEU: ${safeStr(ev.task?.title)} (ID ${ev.task?.id})`);
-      lines.push(`Status: ${safeStr(ev.task?.status)} | Deadline: ${safeStr(ev.task?.deadline)}`);
-      lines.push("");
-    } else if (ev.type === "deleted") {
-      lines.push(`GELÖSCHT: ${safeStr(ev.task?.title)} (ID ${ev.task?.id})`);
-      lines.push("");
-    } else if (ev.type === "updated") {
-      lines.push(`GEÄNDERT: ${safeStr(ev.task?.title)} (ID ${ev.task?.id})`);
-      for (const c of ev.changes) {
-        lines.push(`- ${c.field}: "${safeStr(c.from)}" → "${safeStr(c.to)}"`);
-      }
-      lines.push("");
-    }
-  }
-  return lines.join("\n");
-}
-
-async function sendDigestEmail(toEmail, changeEvents, editor) {
-  const subject = `${MAIL_SUBJECT_PREFIX} Änderungen an deinen Tasks (${changeEvents.length})`;
-  const text = formatDigestText(changeEvents, editor);
-
-  await transporter.sendMail({
-    from: MAIL_FROM,
-    to: toEmail,
-    subject,
-    text
-  });
-}
-
-function enqueueChanges(recipientEmail, changeEvents, editor) {
-  const existing = mailQueue.get(recipientEmail) || { timer: null, items: [], lastEditor: null };
-  existing.items.push(...changeEvents);
-  existing.lastEditor = editor || existing.lastEditor;
-
-  if (!existing.timer) {
-    existing.timer = setTimeout(async () => {
-      const data = mailQueue.get(recipientEmail);
-      if (!data) return;
-
-      // Snapshot then clear before sending (avoid duplicates on error loops)
-      const items = data.items.slice();
-      const ed = data.lastEditor;
-      mailQueue.delete(recipientEmail);
-
-      try {
-        await sendDigestEmail(recipientEmail, items, ed);
-        console.log("Digest sent to", recipientEmail, "items:", items.length);
-      } catch (err) {
-        console.error("Digest send failed to", recipientEmail, err?.message || err);
-        // If you want retry, re-enqueue once:
-        // enqueueChanges(recipientEmail, items, ed);
-      }
-    }, MAIL_DEBOUNCE_MINUTES * 60 * 1000);
-  }
-
-  mailQueue.set(recipientEmail, existing);
-}
-
 // ---- Health
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", (req, res) => res.json({ ok: true }));
 
-// ---- Load: holt tasks+log aus jsonbin
-app.get("/api/data", async (_req, res) => {
-  try {
-    const r = await fetch(jsonbinUrl(), {
-      headers: { "X-Master-Key": JSONBIN_API_KEY }
-    });
-    if (!r.ok) return res.status(502).json({ error: "jsonbin load failed" });
-    const data = await r.json();
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: "server error" });
-  }
-});
-
-// ---- Auth: prüft Passwort und gibt Token
+// ---- Auth: Passwort -> token
 app.post("/api/auth", async (req, res) => {
   try {
-    const password = (req.body?.password ?? "").trim();
+    const password = (req.body?.password ?? "").toString().trim();
     if (!password) return res.status(400).json({ ok: false });
 
     const ok = await bcrypt.compare(password, EDIT_PASSWORD_HASH || "");
@@ -289,80 +119,270 @@ app.post("/api/auth", async (req, res) => {
   }
 });
 
-// ---- Save: schreibt tasks+log zu jsonbin (nur mit gültigem Token) + Diff + Debounce-Mailqueue
-app.put("/api/data", requireEditor, async (req, res) => {
+// ---- Load: tasks+log aus jsonbin
+app.get("/api/data", async (req, res) => {
   try {
-    // Editor-Infos (kommen aus Frontend-Headern)
-    const editor = {
-      name: safeStr(req.headers["x-editor-name"]).trim(),
-      email: safeStr(req.headers["x-editor-email"]).trim()
-    };
+    const r = await fetch(jsonbinUrl(), {
+      headers: {
+        "X-Master-Key": JSONBIN_API_KEY,
+      },
+    });
+    if (!r.ok) return res.status(502).json({ error: "jsonbin load failed" });
+    const data = await r.json();
+    res.json(data);
+  } catch {
+    res.status(500).json({ error: "server error" });
+  }
+});
 
-    // 1) alten Stand von jsonbin holen
-    const oldResp = await fetch(jsonbinUrl(), {
-      headers: { "X-Master-Key": JSONBIN_API_KEY }
+// -------------------- MAIL: Change detection + debounce --------------------
+
+const WATCH_FIELDS = ["status", "title", "description", "deadline", "links", "assignedTo"];
+
+function normalizeTask(t) {
+  const o = {};
+  for (const f of WATCH_FIELDS) o[f] = t?.[f];
+  // normalize arrays for stable compare
+  if (Array.isArray(o.links)) o.links = [...o.links];
+  if (Array.isArray(o.assignedTo)) o.assignedTo = [...o.assignedTo];
+  return o;
+}
+
+function jsonStable(v) {
+  // stable-ish stringify for objects containing arrays/primitives
+  return JSON.stringify(v, (key, value) => {
+    if (Array.isArray(value)) return [...value].sort();
+    return value;
+  });
+}
+
+function diffTasks(oldTasks, newTasks) {
+  const oldMap = new Map((oldTasks || []).map((t) => [t.id, t]));
+  const newMap = new Map((newTasks || []).map((t) => [t.id, t]));
+
+  const changes = []; // {type, id, before, after, recipients:Set<string>}
+  const allIds = new Set([...oldMap.keys(), ...newMap.keys()]);
+
+  for (const id of allIds) {
+    const before = oldMap.get(id);
+    const after = newMap.get(id);
+
+    const beforeAssigned = new Set((before?.assignedTo || []).map(String));
+    const afterAssigned = new Set((after?.assignedTo || []).map(String));
+    const recipients = new Set([...beforeAssigned, ...afterAssigned]);
+
+    if (!before && after) {
+      changes.push({ type: "created", id, before: null, after, recipients });
+      continue;
+    }
+    if (before && !after) {
+      changes.push({ type: "deleted", id, before, after: null, recipients });
+      continue;
+    }
+
+    const b = normalizeTask(before);
+    const a = normalizeTask(after);
+
+    if (jsonStable(b) !== jsonStable(a)) {
+      changes.push({ type: "updated", id, before, after, recipients });
+    }
+  }
+
+  return changes;
+}
+
+function resolveEmailForName(name) {
+  if (!name) return null;
+  const direct = TEAM_EMAILS[name];
+  if (direct) return direct;
+  // fallback: try case-insensitive match
+  const key = Object.keys(TEAM_EMAILS).find((k) => k.toLowerCase() === String(name).toLowerCase());
+  return key ? TEAM_EMAILS[key] : null;
+}
+
+function buildMailTextForRecipient(recipientName, recipientEmail, changes, editorName, editorEmail) {
+  const editorLine =
+    editorName || editorEmail
+      ? `Editor: ${editorName || "-"}${editorEmail ? ` <${editorEmail}>` : ""}`
+      : "Editor: (unknown)";
+
+  const lines = [];
+  lines.push(`${MAIL_SUBJECT_PREFIX} Task-Update`);
+  lines.push("");
+  lines.push(editorLine);
+  lines.push(`Time: ${new Date().toISOString()}`);
+  lines.push("");
+
+  for (const c of changes) {
+    if (c.type === "created") {
+      lines.push(`NEW: ${c.after?.title || "(no title)"} (id=${c.id})`);
+      lines.push(`  Status: ${c.after?.status || "-"}`);
+      lines.push(`  Deadline: ${c.after?.deadline || "-"}`);
+      lines.push("");
+    } else if (c.type === "deleted") {
+      lines.push(`DELETED: ${c.before?.title || "(no title)"} (id=${c.id})`);
+      lines.push("");
+    } else {
+      // updated: show changed fields
+      lines.push(`UPDATED: ${c.after?.title || c.before?.title || "(no title)"} (id=${c.id})`);
+      for (const f of WATCH_FIELDS) {
+        const bv = normalizeTask(c.before)[f];
+        const av = normalizeTask(c.after)[f];
+        if (jsonStable(bv) !== jsonStable(av)) {
+          lines.push(`  - ${f}: ${JSON.stringify(bv)}  ->  ${JSON.stringify(av)}`);
+        }
+      }
+      lines.push("");
+    }
+  }
+
+  return lines.join("\n");
+}
+
+// Debounce store: email -> {recipientName, changes:[], timer, editorName, editorEmail}
+const pendingByEmail = new Map();
+
+async function sendDebouncedMail(email) {
+  const entry = pendingByEmail.get(email);
+  if (!entry) return;
+
+  pendingByEmail.delete(email);
+
+  if (!smtpConfigured || !transporter) {
+    console.log("MAIL: SMTP not configured, skipping send to", email);
+    return;
+  }
+
+  const subject = `${MAIL_SUBJECT_PREFIX} Task-Update (${entry.changes.length})`;
+  const text = buildMailTextForRecipient(
+    entry.recipientName,
+    email,
+    entry.changes,
+    entry.editorName,
+    entry.editorEmail
+  );
+
+  console.log("MAIL: sending to", email, "changes:", entry.changes.length);
+
+  try {
+    await transporter.sendMail({
+      from: MAIL_FROM,
+      to: email,
+      subject,
+      text,
+    });
+    console.log("MAIL: sent OK to", email);
+  } catch (e) {
+    console.log("MAIL: send FAIL to", email, e?.message || e);
+  }
+}
+
+function queueMail(recipientName, recipientEmail, changes, editorName, editorEmail) {
+  if (!recipientEmail) return;
+
+  const existing = pendingByEmail.get(recipientEmail);
+  if (!existing) {
+    const timer = setTimeout(() => {
+      sendDebouncedMail(recipientEmail);
+    }, MAIL_DEBOUNCE_MINUTES * 60 * 1000);
+
+    pendingByEmail.set(recipientEmail, {
+      recipientName,
+      changes: [...changes],
+      timer,
+      editorName,
+      editorEmail,
     });
 
-    let oldRecord = { tasks: [], log: [] };
-    if (oldResp.ok) {
-      const oldJson = await oldResp.json();
-      oldRecord = oldJson?.record || oldRecord;
-    }
+    console.log(
+      "MAIL: queued",
+      recipientEmail,
+      "changes:",
+      changes.length,
+      "debounce(min):",
+      MAIL_DEBOUNCE_MINUTES
+    );
+  } else {
+    // extend existing
+    existing.changes.push(...changes);
+    existing.editorName = editorName || existing.editorName;
+    existing.editorEmail = editorEmail || existing.editorEmail;
 
-    // 2) neuen Stand aus Request
+    clearTimeout(existing.timer);
+    existing.timer = setTimeout(() => {
+      sendDebouncedMail(recipientEmail);
+    }, MAIL_DEBOUNCE_MINUTES * 60 * 1000);
+
+    console.log("MAIL: updated queue", recipientEmail, "total changes:", existing.changes.length);
+  }
+}
+
+// ---- Save: schreibt tasks+log zu jsonbin (nur mit gültigem Token) + mail queue
+app.put("/api/data", requireEditor, async (req, res) => {
+  try {
     const body = req.body || {};
-    const newTasks = body.tasks || [];
-    const newLog = body.log || [];
 
-    // 3) diff berechnen
-    const { created, deleted, updated } = diffTasks(oldRecord.tasks || [], newTasks);
-
-    // 4) pro Empfänger Change-Events sammeln (assignedTo)
-    const perRecipient = new Map(); // email -> events[]
-
-    function addEvent(email, ev) {
-      const arr = perRecipient.get(email) || [];
-      arr.push(ev);
-      perRecipient.set(email, arr);
+    // Load old data first for diff
+    let oldTasks = [];
+    try {
+      const rOld = await fetch(jsonbinUrl(), {
+        headers: { "X-Master-Key": JSONBIN_API_KEY },
+      });
+      if (rOld.ok) {
+        const oldData = await rOld.json();
+        oldTasks = oldData?.record?.tasks || [];
+      }
+    } catch {
+      // If load fails, we still save, but mail diff might be empty
+      oldTasks = [];
     }
 
-    // created: assignedTo aus neuem Task
-    for (const t of created) {
-      const emails = resolveRecipientEmails(t.assignedTo);
-      for (const e of emails) addEvent(e, { type: "created", task: t });
-    }
-
-    // deleted: assignedTo aus altem Task (weil neu weg ist)
-    for (const t of deleted) {
-      const emails = resolveRecipientEmails(t.assignedTo);
-      for (const e of emails) addEvent(e, { type: "deleted", task: t });
-    }
-
-    // updated: assignedTo aus neuem Task
-    for (const u of updated) {
-      const emails = resolveRecipientEmails(u.newTask.assignedTo);
-      for (const e of emails) addEvent(e, { type: "updated", task: u.newTask, changes: u.changes });
-    }
-
-    // 5) enqueue (Debounce)
-    for (const [email, events] of perRecipient.entries()) {
-      if (events.length) enqueueChanges(email, events, editor);
-    }
-
-    // 6) neuen Stand nach jsonbin speichern
+    // Save new data
     const r = await fetch(jsonbinUrl(), {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
-        "X-Master-Key": JSONBIN_API_KEY
+        "X-Master-Key": JSONBIN_API_KEY,
       },
-      body: JSON.stringify({ tasks: newTasks, log: newLog })
+      body: JSON.stringify(body),
     });
 
     if (!r.ok) return res.status(502).json({ error: "jsonbin save failed" });
 
+    // Diff + queue mails AFTER successful save
+    const newTasks = body?.tasks || [];
+    const changes = diffTasks(oldTasks, newTasks);
+
+    if (changes.length === 0) {
+      console.log("MAIL: no relevant task changes detected");
+    } else {
+      // group by recipient name -> email
+      const perRecipient = new Map(); // email -> {name, changes:[]}
+
+      for (const c of changes) {
+        for (const name of c.recipients) {
+          const email = resolveEmailForName(name);
+          if (!email) continue;
+
+          if (!perRecipient.has(email)) perRecipient.set(email, { name, changes: [] });
+          perRecipient.get(email).changes.push(c);
+        }
+      }
+
+      const editorName = req.editorName || "";
+      const editorEmail = req.editorEmail || "";
+
+      for (const [email, payload] of perRecipient.entries()) {
+        queueMail(payload.name, email, payload.changes, editorName, editorEmail);
+      }
+
+      if (perRecipient.size === 0) {
+        console.log("MAIL: changes detected but no recipients matched TEAM_EMAILS_JSON");
+      }
+    }
+
     res.json({ ok: true });
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: "server error" });
   }
 });
